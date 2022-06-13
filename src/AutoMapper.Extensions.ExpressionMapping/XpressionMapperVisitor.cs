@@ -57,10 +57,7 @@ namespace AutoMapper.Extensions.ExpressionMapping
                 var baseExpression = node.GetBaseOfMemberExpression();
                 if (baseExpression?.NodeType == ExpressionType.Constant)
                 {
-                    if (node.Type.IsLiteralType())
-                        return node;
-
-                    return this.Visit
+                    ConstantExpression constantExpression =  (ConstantExpression)this.Visit
                     (
                         Expression.Constant
                         (
@@ -73,6 +70,7 @@ namespace AutoMapper.Extensions.ExpressionMapping
                             node.Type
                         )
                     );
+                    return ExpressionHelpers.BuildConstant(constantExpression.Value, constantExpression.Type, true);
                 }
 
                 return base.VisitMember(node);
@@ -427,17 +425,27 @@ namespace AutoMapper.Extensions.ExpressionMapping
                 {
                     if (node.NodeType == ExpressionType.Coalesce && node.Conversion != null)
                         return Expression.Coalesce(newLeft, newRight, conversion as LambdaExpression);
-                    else
-                        return Expression.MakeBinary
-                        (
-                            node.NodeType,
-                            newLeft,
-                            newRight,
-                            node.IsLiftedToNull,
-                            TypesChanged()
-                                ? Expression.MakeBinary(node.NodeType, newLeft, newRight).Method
-                                : node.Method
-                        );
+                    else if (TypesChanged() && node.Left.Type == node.Right.Type && newLeft.Type != newRight.Type)
+                    {
+                        if (newLeft.TryMappingConstant(Mapper, newRight.Type, out Expression mappedNewLeft))
+                        {
+                            newLeft = mappedNewLeft;
+                        }
+                        else if (newRight.TryMappingConstant(Mapper, newLeft.Type, out Expression mappedNewRight))
+                        {
+                            newRight = mappedNewRight;
+                        }
+                    }
+                    return Expression.MakeBinary
+                    (
+                        node.NodeType,
+                        newLeft,
+                        newRight,
+                        node.IsLiftedToNull,
+                        TypesChanged()
+                            ? Expression.MakeBinary(node.NodeType, newLeft, newRight).Method
+                            : node.Method
+                    );
                 }
 
                 return node;
@@ -538,16 +546,21 @@ namespace AutoMapper.Extensions.ExpressionMapping
                 ? node.Method.GetGenericArguments().Select(type => this.TypeMappings.ReplaceType(type)).ToList()//not converting the type it is not in the typeMappings dictionary
                 : null;
 
-            ConvertTypesIfNecessary(node.Method.GetParameters(), listOfArgumentsForNewMethod, node.Method);
+            if (node.Method.IsStatic)
+            {
+                ConvertTypesIfNecessary(node.Method.GetParameters(), listOfArgumentsForNewMethod, node.Method);
+                return GetStaticExpression();
+            }
+            Expression newInstance = this.Visit(node.Object);
+            MethodInfo newTargetMethod = newInstance.Type == node.Object.Type ? node.Method : newInstance.Type.GetMethod(node.Method.Name);
+            ConvertTypesIfNecessary(newTargetMethod.GetParameters(), listOfArgumentsForNewMethod, newTargetMethod);
 
-            return node.Method.IsStatic
-                    ? GetStaticExpression()
-                    : GetInstanceExpression(this.Visit(node.Object));
+            return GetInstanceExpression(newInstance);
 
             MethodCallExpression GetInstanceExpression(Expression instance)
                 => node.Method.IsGenericMethod
                     ? Expression.Call(instance, node.Method.Name, typeArgsForNewMethod.ToArray(), listOfArgumentsForNewMethod.ToArray())
-                    : Expression.Call(instance, node.Method, listOfArgumentsForNewMethod.ToArray());
+                    : Expression.Call(instance, newTargetMethod, listOfArgumentsForNewMethod.ToArray());
 
             MethodCallExpression GetStaticExpression()
                 => node.Method.IsGenericMethod
@@ -560,11 +573,28 @@ namespace AutoMapper.Extensions.ExpressionMapping
             if (mInfo.IsGenericMethod)
                 return;
 
+            // While the signature of Equals accepts object, it generally only works as expected when the types actually match
+            if (mInfo.Name == nameof(object.Equals) 
+                && parameters.Length == 1 && parameters[0].ParameterType == typeof(object) 
+                && listOfArgumentsForNewMethod[0].TryMappingConstant(Mapper, mInfo.DeclaringType, out Expression newArgument))
+            {
+                listOfArgumentsForNewMethod[0] = newArgument;
+                return;
+            }
+
             for (int i = 0; i < listOfArgumentsForNewMethod.Count; i++)
             {
-                if (listOfArgumentsForNewMethod[i].Type != parameters[i].ParameterType
-                    && parameters[i].ParameterType.IsAssignableFrom(listOfArgumentsForNewMethod[i].Type))
-                    listOfArgumentsForNewMethod[i] = Expression.Convert(listOfArgumentsForNewMethod[i], parameters[i].ParameterType);
+                if (listOfArgumentsForNewMethod[i].Type != parameters[i].ParameterType)
+                {
+                    if (parameters[i].ParameterType.IsAssignableFrom(listOfArgumentsForNewMethod[i].Type))
+                    {
+                        listOfArgumentsForNewMethod[i] = Expression.Convert(listOfArgumentsForNewMethod[i], parameters[i].ParameterType);
+                    }
+                    else if (listOfArgumentsForNewMethod[i].TryMappingConstant(Mapper, parameters[i].ParameterType, out Expression newParameter))
+                    {
+                        listOfArgumentsForNewMethod[i] = newParameter;
+                    }
+                }
             }
         }
 
@@ -693,7 +723,6 @@ namespace AutoMapper.Extensions.ExpressionMapping
             if (sourceFullName.IndexOf(period, StringComparison.OrdinalIgnoreCase) < 0)
             {
                 var propertyMap = typeMap.GetMemberMapByDestinationProperty(sourceFullName);
-                var sourceMemberInfo = typeSource.GetFieldOrProperty(propertyMap.GetDestinationName());
                 if (propertyMap.ValueResolverConfig != null)
                 {
                     throw new InvalidOperationException(Resource.customResolversNotSupported);
@@ -701,20 +730,6 @@ namespace AutoMapper.Extensions.ExpressionMapping
 
                 if (propertyMap.CustomMapExpression == null && !propertyMap.SourceMembers.Any())
                     throw new InvalidOperationException(string.Format(CultureInfo.CurrentCulture, Resource.srcMemberCannotBeNullFormat, typeSource.Name, typeDestination.Name, sourceFullName));
-
-                CompareSourceAndDestLiterals
-                (
-                    propertyMap.CustomMapExpression != null ? propertyMap.CustomMapExpression.ReturnType : propertyMap.SourceMember.GetMemberType(),
-                    propertyMap.CustomMapExpression != null ? propertyMap.CustomMapExpression.ToString() : propertyMap.SourceMember.Name,
-                    sourceMemberInfo.GetMemberType()
-                );
-
-                void CompareSourceAndDestLiterals(Type mappedPropertyType, string mappedPropertyDescription, Type sourceMemberType)
-                {
-                    //switch from IsValueType to IsLiteralType because we do not want to throw an exception for all structs
-                    if ((mappedPropertyType.IsLiteralType() || sourceMemberType.IsLiteralType()) && sourceMemberType != mappedPropertyType)
-                        throw new InvalidOperationException(string.Format(CultureInfo.CurrentCulture, Resource.expressionMapValueTypeMustMatchFormat, mappedPropertyType.Name, mappedPropertyDescription, sourceMemberType.Name, propertyMap.GetDestinationName()));
-                }
 
                 if (propertyMap.IncludedMember?.ProjectToCustomSource != null)
                     propertyMapInfoList.Add(new PropertyMapInfo(propertyMap.IncludedMember.ProjectToCustomSource, new List<MemberInfo>()));

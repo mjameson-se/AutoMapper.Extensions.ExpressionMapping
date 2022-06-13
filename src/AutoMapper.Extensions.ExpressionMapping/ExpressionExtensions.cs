@@ -38,6 +38,42 @@ namespace AutoMapper
         {
             return exp.Body.GetMembers().LastOrDefault()?.Expression == exp.Parameters.First();
         }
+
+        private static bool IsEffectivelyConstant(this Expression exp, out ConstantExpression constant, out bool isParameter)
+        {
+            if (exp is ConstantExpression cnst)
+            {
+                constant = cnst;
+                isParameter = false;
+                return true;
+            }
+            else if (exp is MemberExpression member && member.Expression is ConstantExpression memberConst)
+            {
+                constant = memberConst;
+                isParameter = true;
+                return true;
+            }
+            constant = null;
+            isParameter = false;
+            return false;
+        }
+
+        public static bool TryMappingConstant(this Expression exp, IMapper mapper, Type newType, out Expression newExp)
+        {
+            if (exp.IsEffectivelyConstant(out ConstantExpression constant, out bool isParameter))
+            {
+                if (constant.Type == newType)
+                {
+                    newExp = exp;
+                    return true;
+                }
+                object newValue = mapper.MapObject(ExpressionHelpers.Unbox(constant.Value), exp.Type, newType);
+                newExp = ExpressionHelpers.BuildConstant(newValue, newType, isParameter);
+                return true;
+            }
+            newExp = null;
+            return false;
+        }
     }
 
     internal static class ExpressionHelpers
@@ -67,5 +103,46 @@ namespace AutoMapper
 
         private static Type GetCurrentType(MemberInfo member, Type type)
             => member?.GetMemberType() ?? type;
+
+        #region Boxing
+        private interface IBox
+        {
+            public object GetValue();
+        }
+
+        private sealed class StronglyTypedBox<T> : IBox
+        {
+            public StronglyTypedBox(T value) // Used via reflection
+            {
+                Value = value;
+            }
+
+            public T Value { get; }
+
+            public object GetValue() => Value;
+        }
+
+        public static object Unbox(object mightBeBoxed) => mightBeBoxed is IBox box ? box.GetValue() : mightBeBoxed;
+        #endregion
+
+        /// <summary>
+        /// Builds a constant expression from the given value with the target type. In some cases, 
+        /// for maximal interoperability with EntityFramework, it is preferred to translate member references
+        /// into member references (referencing arbitrary "boxing" instances) because EF will cache expression
+        /// compilation more efficiently if the constants are not inlined.
+        /// </summary>
+        /// <param name="constantValue">the value for the constant</param>
+        /// <param name="constantType">the type of the constant, necessary when the value is null.</param>
+        /// <param name="isMemberReference">if true, a member reference is constructed to wrap the constant</param>
+        /// <returns>an expression representing the new constant expression.</returns>
+        public static Expression BuildConstant(object constantValue, Type constantType, bool isMemberReference)
+        {
+            if (isMemberReference)
+            {
+                object holder = typeof(StronglyTypedBox<>).MakeGenericType(constantType).GetConstructor(new[] { constantType }).Invoke(new[] { constantValue });
+                return Property(Constant(holder), nameof(StronglyTypedBox<object>.Value));
+            }
+            return Constant(constantValue, constantType);
+        }
     }
 }

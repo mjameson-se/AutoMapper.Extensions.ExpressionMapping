@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
+using System.Net;
 using Xunit;
 
 namespace AutoMapper.Extensions.ExpressionMapping.UnitTests
@@ -190,6 +191,7 @@ namespace AutoMapper.Extensions.ExpressionMapping.UnitTests
 
             //Assert
             Assert.Equal(ExpressionType.MemberAccess, mappedrhs.NodeType);
+            Assert.Equal(typeof(string), mappedrhs.Type);
         }
 
         [Fact]
@@ -254,24 +256,36 @@ namespace AutoMapper.Extensions.ExpressionMapping.UnitTests
                     .ConvertUsing(i => DateTimeOffset.FromUnixTimeSeconds(i.SecondsSinceUnixEpoch));
                 c.CreateMap<DateTimeOffset?, Instant>().ConvertUsing(d => d.HasValue ? new Instant { SecondsSinceUnixEpoch = d.Value.ToUnixTimeSeconds() } : default);
                 c.CreateMap<DateTimeOffset, Instant>().ConvertUsing(d => new Instant { SecondsSinceUnixEpoch = d.ToUnixTimeSeconds() });
+                c.CreateMap<string, IPAddress>().ConvertUsing(ip => IPAddress.Parse(ip));
+                c.CreateMap<IPAddress, string>().ConvertUsing(ip => ip.ToString());
 
-                c.CreateMap<ItemWithInstant, ItemWithDateTimeOffset>();
-                c.CreateMap<ItemWithDateTimeOffset, ItemWithInstant>();
+                c.CreateMap<Sensor, SensorDto>();
+                c.CreateMap<SensorDto, Sensor>();
             });
 
             config.AssertConfigurationIsValid();
             var mapper = config.CreateMapper();
             DateTimeOffset firstReleaseDate = DateTimeOffset.FromUnixTimeSeconds(0);
             DateTimeOffset lastReleaseDate = DateTimeOffset.FromUnixTimeSeconds(10);
-            Expression<Func<ItemWithDateTimeOffset, bool>> exp = x => x.Date.HasValue && (x.Date >= firstReleaseDate && x.Date <= lastReleaseDate);
+            string excludeIpAddress = "127.0.0.1";
+            Expression<Func<SensorDto, bool>> exp = x => x.Date.HasValue && (x.Date >= firstReleaseDate && x.Date <= lastReleaseDate) && !x.IpAddress.Equals(excludeIpAddress);
+            Expression<Func<SensorDto, bool>> exp2 = x => x.DisplayName.StartsWith("Foo") && !x.IpAddress.Equals(excludeIpAddress);
 
             //Act
-            Expression<Func<ItemWithInstant, bool>> expMapped = mapper.MapExpression<Expression<Func<ItemWithInstant, bool>>>(exp);
+            Expression<Func<Sensor, bool>> expMapped = mapper.MapExpression<Expression<Func<Sensor, bool>>>(exp);
+            Expression<Func<Sensor, bool>> exp2Mapped = mapper.MapExpression<Expression<Func<Sensor, bool>>>(exp2);
 
             //Assert
             Assert.NotNull(expMapped);
-            Assert.True(expMapped.Compile()(new ItemWithInstant { Date = new Instant { SecondsSinceUnixEpoch = 7 } }));
-            Assert.False(expMapped.Compile()(new ItemWithInstant { Date = new Instant { SecondsSinceUnixEpoch = 12 } }));
+            Assert.True(expMapped.Compile()(new Sensor { Date = new Instant { SecondsSinceUnixEpoch = 7 }, IpAddress = IPAddress.IPv6Any }));
+            Assert.False(expMapped.Compile()(new Sensor { Date = new Instant { SecondsSinceUnixEpoch = 12 }, IpAddress = IPAddress.IPv6Any }));
+            Assert.False(expMapped.Compile()(new Sensor { Date = new Instant { SecondsSinceUnixEpoch = 7 }, IpAddress = IPAddress.Loopback }));
+
+            Assert.NotNull(exp2Mapped);
+            Func<Sensor, bool> func = exp2Mapped.Compile();
+            Assert.True(func(new Sensor { DisplayName = "Food Court O2 Levels", IpAddress = IPAddress.IPv6Any }));
+            Assert.False(func(new Sensor { DisplayName = "Foosball Velocity", IpAddress = IPAddress.Loopback }));
+            Assert.False(func(new Sensor { DisplayName = "Bathroom CO2 Levels", IpAddress = IPAddress.IPv6Any }));
         }
     }
 
@@ -490,14 +504,18 @@ namespace AutoMapper.Extensions.ExpressionMapping.UnitTests
         public DateTime Date { get; set; }
     }
 
-    public struct ItemWithDateTimeOffset
+    public struct SensorDto
     {
         public DateTimeOffset? Date { get; set; }
+        public string IpAddress { get; set; }
+        public string DisplayName { get; set; }
     }
 
-    public struct ItemWithInstant
+    public struct Sensor
     {
         public Instant Date { get; set; }
+        public IPAddress IpAddress { get; set; }
+        public string DisplayName { get; set; }
     }
 
     public struct Instant
